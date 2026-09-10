@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Suivi en direct</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html, body { margin: 0; height: 100%; background: #0a0e17; color: #E8ECF1;
+               font-family: system-ui, -apple-system, sans-serif; }
+  #map { position: absolute; inset: 0; z-index: 0; }
+
+  #panel {
+    position: absolute; left: 0; right: 0; bottom: 0; z-index: 10;
+    background: linear-gradient(180deg, rgba(10,14,23,0) 0%, rgba(10,14,23,0.92) 30%, #0a0e17 100%);
+    padding: 40px 16px 18px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  #status {
+    position: absolute; top: 14px; left: 14px; right: 14px; z-index: 10;
+    display: flex; align-items: center; gap: 8px;
+    background: #111826; border: 1px solid rgba(255,255,255,0.09);
+    border-radius: 10px; padding: 9px 14px; font-size: 13px; font-weight: 600;
+  }
+  #status .dot { width: 8px; height: 8px; border-radius: 50%; background: #6b7686; flex-shrink: 0; }
+  #status.live .dot { background: #4DE8E0; box-shadow: 0 0 6px 1px rgba(77,232,224,0.7); }
+  #status.ended .dot { background: #f85149; }
+
+  .row { display: flex; gap: 10px; }
+  .tile {
+    flex: 1; background: #111826; border: 1px solid rgba(255,255,255,0.09);
+    border-radius: 10px; padding: 10px 12px;
+  }
+  .tile .lbl { font-size: 10.5px; text-transform: uppercase; letter-spacing: 1.2px;
+               color: #8B96A8; margin-bottom: 3px; }
+  .tile .val { font-size: 17px; font-weight: 700; }
+  #dest { font-size: 13px; color: #8B96A8; }
+  #dest b { color: #E8ECF1; font-weight: 600; }
+
+  #erreur {
+    position: absolute; inset: 0; z-index: 20; display: none;
+    align-items: center; justify-content: center; text-align: center;
+    padding: 24px; background: #0a0e17;
+  }
+  #erreur.visible { display: flex; }
+  #erreur p { max-width: 340px; color: #8B96A8; font-size: 14px; line-height: 1.5; }
+</style>
+</head>
+<body>
+
+  <div id="status"><span class="dot"></span><span id="status-txt">Connexion…</span></div>
+
+  <div id="map"></div>
+
+  <div id="panel">
+    <div id="dest">Destination : <b id="dest-val">—</b></div>
+    <div class="row">
+      <div class="tile"><div class="lbl">Vitesse</div><div class="val" id="val-vitesse">—</div></div>
+      <div class="tile"><div class="lbl">Arrivée estimée</div><div class="val" id="val-eta">—</div></div>
+      <div class="tile"><div class="lbl">Dernière position</div><div class="val" id="val-maj">—</div></div>
+    </div>
+  </div>
+
+  <div id="erreur">
+    <p id="erreur-txt">Lien de suivi invalide — il manque l'identifiant de session dans l'adresse.</p>
+  </div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.112.4/dist/umd/supabase.js"></script>
+<script>
+/* Suivi en direct — page réceptrice de js/07-gps-position.js (Go_app).
+   Même projet Supabase que le classement de l'app (js/21-classement.js) : la clé
+   ci-dessous est la clé publishable, publique par construction.
+
+   ⚠ AUCUNE TABLE, AUCUNE RLS À CONFIGURER. Cette page s'abonne à un canal Realtime
+   Broadcast nommé par l'identifiant de session (`liveshare:<id>`) — du pub/sub
+   éphémère, rien n'est lu ni écrit en base. La sécurité tient entièrement à
+   l'identifiant : le connaître suffit à s'abonner, et lui seul protège la position
+   (voir le commentaire de _lsGenId dans js/07-gps-position.js). Ne jamais republier
+   ce lien publiquement — il vaut ce que vaut l'identifiant qu'il contient. */
+const SUPABASE_URL = 'https://husqmdqwqunufgjbcmsk.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_2IOxe6QVMsUflUfFuoUN_A_loUc8zbL';
+
+const sessionId = new URLSearchParams(location.search).get('s');
+
+const statusEl   = document.getElementById('status');
+const statusTxt  = document.getElementById('status-txt');
+const erreurEl   = document.getElementById('erreur');
+const erreurTxt  = document.getElementById('erreur-txt');
+
+function afficherErreur(msg) {
+    erreurTxt.textContent = msg;
+    erreurEl.classList.add('visible');
+}
+
+if (!sessionId) {
+    afficherErreur("Lien de suivi invalide — il manque l'identifiant de session dans l'adresse.");
+} else if (typeof supabase === 'undefined' || !supabase.createClient) {
+    afficherErreur("Le service de suivi n'a pas pu se charger (connexion bloquée ou hors ligne). Réessaie de recharger la page.");
+} else {
+    demarrerSuivi();
+}
+
+function demarrerSuivi() {
+    const map = L.map('map', { zoomControl: false, attributionControl: false })
+        .setView([48.8566, 2.3522], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+    L.control.attribution({ prefix: false }).addAttribution('© OpenStreetMap').addTo(map);
+
+    const icone = L.divIcon({
+        className: '',
+        html: '<div style="width:16px;height:16px;border-radius:50%;background:#4DE8E0;' +
+              'box-shadow:0 0 0 5px rgba(77,232,224,0.25),0 0 10px 2px rgba(77,232,224,0.8);"></div>',
+        iconSize: [16, 16], iconAnchor: [8, 8],
+    });
+    let marker = null;
+    let premierPoint = true;
+
+    const client = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+    const canal = client.channel('liveshare:' + sessionId);
+
+    canal
+        .on('broadcast', { event: 'position' }, ({ payload }) => {
+            if (!payload) return;
+
+            if (payload.active === false) {
+                statusEl.className = 'ended';
+                statusTxt.textContent = 'Partage terminé';
+                if (marker) marker.setOpacity(0.4);
+                return;
+            }
+
+            statusEl.className = 'live';
+            statusTxt.textContent = 'En direct';
+
+            const { lat, lng, speed, eta, dest, ts } = payload;
+            if (typeof lat === 'number' && typeof lng === 'number') {
+                if (!marker) {
+                    marker = L.marker([lat, lng], { icon: icone }).addTo(map);
+                } else {
+                    marker.setLatLng([lat, lng]);
+                }
+                map.setView([lat, lng], premierPoint ? 15 : map.getZoom());
+                premierPoint = false;
+            }
+
+            document.getElementById('val-vitesse').textContent =
+                (typeof speed === 'number') ? speed + ' km/h' : '—';
+            document.getElementById('val-eta').textContent = eta || '—';
+            document.getElementById('dest-val').textContent = dest || '—';
+            document.getElementById('val-maj').textContent =
+                ts ? new Date(ts).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
+        })
+        .subscribe((statut) => {
+            if (statut === 'SUBSCRIBED') {
+                statusTxt.textContent = 'En attente de la première position…';
+            } else if (statut === 'CHANNEL_ERROR' || statut === 'TIMED_OUT') {
+                afficherErreur("La connexion au suivi a échoué. Vérifie ta connexion et recharge la page.");
+            }
+        });
+}
+</script>
+</body>
+</html>
