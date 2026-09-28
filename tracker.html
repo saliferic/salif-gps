@@ -4,11 +4,15 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <title>Suivi en direct</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
 <style>
   html, body { margin: 0; height: 100%; background: #0a0e17; color: #E8ECF1;
                font-family: system-ui, -apple-system, sans-serif; }
   #map { position: absolute; inset: 0; z-index: 0; }
+  /* L'attribution se pose en haut à gauche, SOUS le bandeau d'état : en bas elle
+     serait cachée par le panneau des chiffres, or elle est une condition
+     d'utilisation d'OpenFreeMap et d'OpenStreetMap, pas un ornement. */
+  .maplibregl-ctrl-top-left { top: 58px; }
 
   #panel {
     position: absolute; left: 0; right: 0; bottom: 0; z-index: 10;
@@ -34,6 +38,8 @@
   .tile .lbl { font-size: 10.5px; text-transform: uppercase; letter-spacing: 1.2px;
                color: #8B96A8; margin-bottom: 3px; }
   .tile .val { font-size: 17px; font-weight: 700; }
+  .tile .sub { font-size: 12px; color: #8B96A8; margin-top: 2px; }
+  .tile .sub:empty { display: none; }
   #dest { font-size: 13px; color: #8B96A8; }
   #dest b { color: #E8ECF1; font-weight: 600; }
 
@@ -56,7 +62,7 @@
     <div id="dest">Destination : <b id="dest-val">—</b></div>
     <div class="row">
       <div class="tile"><div class="lbl">Vitesse</div><div class="val" id="val-vitesse">—</div></div>
-      <div class="tile"><div class="lbl">Arrivée estimée</div><div class="val" id="val-eta">—</div></div>
+      <div class="tile"><div class="lbl">Arrivée</div><div class="val" id="val-eta">—</div><div class="sub" id="val-reste"></div></div>
       <div class="tile"><div class="lbl">Dernière position</div><div class="val" id="val-maj">—</div></div>
     </div>
   </div>
@@ -65,7 +71,7 @@
     <p id="erreur-txt">Lien de suivi invalide — il manque l'identifiant de session dans l'adresse.</p>
   </div>
 
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.112.4/dist/umd/supabase.js"></script>
 <script>
 /* Suivi en direct — page réceptrice de js/07-gps-position.js (Go_app).
@@ -101,18 +107,81 @@ if (!sessionId) {
     demarrerSuivi();
 }
 
-function demarrerSuivi() {
-    const map = L.map('map', { zoomControl: false, attributionControl: false })
-        .setView([48.8566, 2.3522], 13);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
-    L.control.attribution({ prefix: false }).addAttribution('© OpenStreetMap').addTo(map);
+/* ── Heure d'arrivée (28/09/2026) ──────────────────────────────────────────────
+   Demande de la première personne à avoir suivi un trajet : « 18h30 », avec le
+   temps restant. L'app envoie `arriveeTs`, un HORODATAGE : l'heure s'affiche dans le
+   fuseau de qui regarde, et le temps restant se recalcule ici toutes les 15 s — il
+   continue donc de décompter même si deux positions tardent.
+   ⚠ REPLI SUR `eta` : un APK antérieur n'envoie que le texte « 24m 58s ». On
+   l'affiche alors tel quel, comme avant, plutôt qu'une case vide. */
+let arriveeTs = null;
 
-    const icone = L.divIcon({
-        className: '',
-        html: '<div style="width:16px;height:16px;border-radius:50%;background:#4DE8E0;' +
-              'box-shadow:0 0 0 5px rgba(77,232,224,0.25),0 0 10px 2px rgba(77,232,224,0.8);"></div>',
-        iconSize: [16, 16], iconAnchor: [8, 8],
+function heureFr(ms) {
+    const d = new Date(ms);
+    return d.getHours() + 'h' + String(d.getMinutes()).padStart(2, '0');
+}
+function resteFr(ms) {
+    const min = Math.round((ms - Date.now()) / 60000);
+    if (min <= 0) return 'arrivée imminente';
+    if (min < 60) return 'dans ' + min + ' min';
+    const h = Math.floor(min / 60), m = min % 60;
+    return 'dans ' + h + ' h' + (m ? ' ' + String(m).padStart(2, '0') : '');
+}
+function majArrivee() {
+    if (arriveeTs === null) return;
+    document.getElementById('val-eta').textContent = heureFr(arriveeTs);
+    document.getElementById('val-reste').textContent = resteFr(arriveeTs);
+}
+const minuterieArrivee = setInterval(majArrivee, 15000);
+
+function demarrerSuivi() {
+    /* ═══ FOND OPENFREEMAP, AFFICHÉ PAR MAPLIBRE (28/09/2026) ═══════════════════
+       Remplace les tuiles de tile.openstreetmap.org, affichées par Leaflet : la
+       politique d'usage de ces serveurs communautaires déconseille les applications,
+       et leur rendu est chargé.
+       ⚠ PAS CARTO, BIEN QU'IL AIT ÉTÉ LE PREMIER CHOIX : essayé le 28/09/2026, il
+       sert désormais à TOUT LE MONDE une tuile-filigrane « API KEY REQUIRED » — même
+       tuile, même empreinte, quelle que soit l'origine de la demande (vérifié depuis
+       127.0.0.1 et avec l'origine saliferic.github.io). Le conseil « gratuit, sans clé »
+       qu'on lit partout est périmé.
+       OpenFreeMap : gratuit, sans clé ni inscription, cartes VECTORIELLES — d'où
+       MapLibre à la place de Leaflet, qui ne sait afficher que des images.
+       Paramètre d'adresse `fond=sombre|clair` pour comparer sans republier : le lien
+       envoyé par l'app ne le porte pas, c'est donc FOND_DEFAUT que voit qui suit.
+       « couleur » par défaut depuis le 28/09/2026 (choix utilisateur, sur captures des
+       trois fonds) : le plus lisible pour quelqu'un qui ne connaît pas le quartier.
+       ⚠ L'attribution (fournie par le style lui-même) est une CONDITION d'utilisation :
+       ne pas passer `attributionControl: false` sans la reposer ailleurs. */
+    const FONDS = { sombre: 'dark', clair: 'positron', couleur: 'liberty' };
+    const FOND_DEFAUT = 'couleur';
+    const fondDemande = new URLSearchParams(location.search).get('fond');
+    const fond = Object.prototype.hasOwnProperty.call(FONDS, fondDemande) ? fondDemande : FOND_DEFAUT;
+    const map = new maplibregl.Map({
+        container: 'map',
+        style: 'https://tiles.openfreemap.org/styles/' + FONDS[fond],
+        center: [2.3522, 48.8566], zoom: 13,
+        attributionControl: false,
     });
+    map.addControl(new maplibregl.AttributionControl({ compact: true }), 'top-left');
+    /* MapLibre ouvre l'attribution compacte au chargement : une bande blanche sur
+       toute la largeur, sous le bandeau d'état. On la replie sur son bouton « i »,
+       d'où elle reste lisible d'un appui — elle n'est pas retirée. */
+    map.once('load', () => {
+        const attrib = document.querySelector('.maplibregl-ctrl-attrib');
+        if (attrib) attrib.classList.remove('maplibregl-compact-show');
+    });
+
+    /* Le point du véhicule : un élément DOM, pas une couche — il reste net à tout zoom.
+       ROUGE depuis le 28/09/2026 (demande utilisateur), turquoise avant. Le contour
+       BLANC n'est pas décoratif : sans lui, le rouge se fond dans les routes orangées
+       du fond « couleur » et s'éteint sur le fond sombre. Le halo pâle dit « c'est ici »
+       sans masquer la rue sous le point. `box-sizing` : les 3 px de contour sont
+       comptés DANS les 18 px, sinon le point grossit et se décentre de son ancre. */
+    const pointEl = document.createElement('div');
+    pointEl.style.cssText = 'box-sizing:border-box;width:18px;height:18px;border-radius:50%;' +
+        'background:#E53935;border:3px solid #fff;' +
+        'box-shadow:0 0 0 6px rgba(229,57,53,0.22),0 1px 4px rgba(0,0,0,0.45);' +
+        'transition:opacity .4s';
     let marker = null;
     let premierPoint = true;
 
@@ -126,33 +195,48 @@ function demarrerSuivi() {
             if (payload.active === false) {
                 statusEl.className = 'ended';
                 statusTxt.textContent = 'Partage terminé';
-                if (marker) marker.setOpacity(0.4);
+                pointEl.style.opacity = '0.4';
+                // Plus rien ne viendra : le décompte s'arrête sur la dernière heure connue.
+                clearInterval(minuterieArrivee);
+                document.getElementById('val-reste').textContent = '';
                 return;
             }
 
             statusEl.className = 'live';
             statusTxt.textContent = 'En direct';
 
-            const { lat, lng, speed, eta, dest, ts } = payload;
+            const { lat, lng, speed, eta, dest, ts } = payload;   // arriveeTs : voir plus bas
             if (typeof lat === 'number' && typeof lng === 'number') {
                 if (!marker) {
-                    marker = L.marker([lat, lng], { icon: icone }).addTo(map);
+                    marker = new maplibregl.Marker({ element: pointEl }).setLngLat([lng, lat]).addTo(map);
                 } else {
-                    marker.setLatLng([lat, lng]);
+                    marker.setLngLat([lng, lat]);
                 }
-                map.setView([lat, lng], premierPoint ? 15 : map.getZoom());
+                /* Premier point : on saute dessus au zoom 15. Ensuite on glisse sans
+                   toucher au zoom — celui qu'a choisi la personne qui regarde. */
+                if (premierPoint) map.jumpTo({ center: [lng, lat], zoom: 15 });
+                else map.easeTo({ center: [lng, lat], duration: 800 });
                 premierPoint = false;
             }
 
             document.getElementById('val-vitesse').textContent =
                 (typeof speed === 'number') ? speed + ' km/h' : '—';
-            document.getElementById('val-eta').textContent = eta || '—';
+            if (typeof payload.arriveeTs === 'number' && isFinite(payload.arriveeTs)) {
+                arriveeTs = payload.arriveeTs;
+                majArrivee();
+            } else {
+                // Ancien APK, ou pas d'arrivée connue (trajet libre) : affichage d'avant.
+                arriveeTs = null;
+                document.getElementById('val-eta').textContent = eta || '—';
+                document.getElementById('val-reste').textContent = '';
+            }
             document.getElementById('dest-val').textContent = dest || '—';
             document.getElementById('val-maj').textContent =
                 ts ? new Date(ts).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
         })
         .subscribe((statut) => {
-            if (statut === 'SUBSCRIBED') {
+            // Une confirmation d'abonnement tardive n'efface pas un « En direct » déjà affiché.
+            if (statut === 'SUBSCRIBED' && statusEl.className !== 'live') {
                 statusTxt.textContent = 'En attente de la première position…';
             } else if (statut === 'CHANNEL_ERROR' || statut === 'TIMED_OUT') {
                 afficherErreur("La connexion au suivi a échoué. Vérifie ta connexion et recharge la page.");
