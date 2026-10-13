@@ -96,8 +96,11 @@
         integrity="sha384-SYKAG6cglRMN0RVvhNeBY0r3FYKNOJtznwA0v7B5Vp9tr31xAHsZC0DqkQ/pZDmj" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.112.4/dist/umd/supabase.js"
         integrity="sha384-ysv13JVP3fufiEXfjML9OdCa/rRbMJvUBOWyor82wfuK8INNZAvmbxHgKIHi+oqz" crossorigin="anonymous"></script>
-<!-- Ordre obligatoire : la vérification avant la page qui l'appelle. -->
-<script src="signature-partage.js"></script>
-<script src="tracker.js"></script>
+<!-- Ordre obligatoire : la vérification avant la page qui l'appelle.
+     `?v=` change à chaque republication, LE MÊME sur les deux : GitHub Pages sert ses
+     fichiers avec 10 min de cache, et sans lui un suiveur pourrait recevoir le
+     tracker.js neuf avec le signature-partage.js d'avant (13/10/2026 : v=2). -->
+<script src="signature-partage.js?v=2"></script>
+<script src="tracker.js?v=2"></script>
 </body>
 </html>

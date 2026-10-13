@@ -4,8 +4,10 @@
 
    ⚠ AUCUNE TABLE, AUCUNE RLS À CONFIGURER. Cette page s'abonne à un canal Realtime
    Broadcast nommé par l'identifiant de session (`liveshare:<id>`) — du pub/sub
-   éphémère, rien n'est lu ni écrit en base. L'identifiant protège la LECTURE : le
-   connaître suffit à s'abonner. Ne jamais republier ce lien publiquement.
+   éphémère, rien n'est lu ni écrit en base. Connaître l'identifiant suffit à s'abonner,
+   mais depuis le 13/10/2026 les messages sont CHIFFRÉS par une clé que seul le lien
+   porte (`c`) : l'abonné qui n'a que l'identifiant ne lit rien. Le lien entier, lui,
+   donne tout — ne jamais le republier publiquement.
    ⚠⚠ L'ÉCRITURE, ELLE, EST PROTÉGÉE PAR LA SIGNATURE (02/10/2026) : le canal accepte
    les messages de quiconque connaît l'identifiant. Dès que le lien porte une clé
    (`k`), on refuse tout message qu'elle ne vérifie pas — voir signature-partage.js.
@@ -29,25 +31,32 @@ function afficherErreur(msg) {
 }
 
 /* ⚠ Un lien qui porte une clé illisible s'ARRÊTE ici : retomber sur les messages en
-   clair rendrait la signature facultative pour qui sait abîmer un lien. */
+   clair rendrait la signature facultative pour qui sait abîmer un lien.
+   ⚠⚠ Un lien SANS clé s'arrête aussi (13/10/2026) : le mode en clair n'existe plus —
+   voir `lireMessagePartage()`. */
 async function demarrer() {
     if (!sessionId) {
         afficherErreur("Lien de suivi invalide — il manque l'identifiant de session dans l'adresse.");
+        return;
+    }
+    if (!lien.k) {
+        afficherErreur("Ce lien vient d'une ancienne version de l'application et n'est plus accepté. Demande à la personne de mettre l'application à jour et de te renvoyer un lien.");
         return;
     }
     if (typeof supabase === 'undefined' || !supabase.createClient) {
         afficherErreur("Le service de suivi n'a pas pu se charger (connexion bloquée ou hors ligne). Réessaie de recharger la page.");
         return;
     }
-    let cle = null;
-    if (lien.k) {
-        cle = await importerClePartage(lien.k);
-        if (!cle) {
-            afficherErreur("Lien de suivi abîmé — il a sans doute été coupé en le copiant. Demande à la personne de te le renvoyer.");
-            return;
-        }
+    const abime = "Lien de suivi abîmé — il a sans doute été coupé en le copiant. Demande à la personne de te le renvoyer.";
+    const cle = await importerClePartage(lien.k);
+    if (!cle) { afficherErreur(abime); return; }
+    // `c` absent : lien signé non chiffré, émis du 02 au 13/10/2026 — toujours lu.
+    let chiffre = null;
+    if (lien.c) {
+        chiffre = await importerCleChiffre(lien.c);
+        if (!chiffre) { afficherErreur(abime); return; }
     }
-    demarrerSuivi(cle);
+    demarrerSuivi(cle, chiffre);
 }
 demarrer();
 
@@ -78,7 +87,7 @@ function majArrivee() {
 }
 const minuterieArrivee = setInterval(majArrivee, 15000);
 
-function demarrerSuivi(cle) {
+function demarrerSuivi(cle, chiffre) {
     /* ═══ FOND OPENFREEMAP, AFFICHÉ PAR MAPLIBRE (28/09/2026) ═══════════════════
        Remplace les tuiles de tile.openstreetmap.org, affichées par Leaflet : la
        politique d'usage de ces serveurs communautaires déconseille les applications,
@@ -181,7 +190,7 @@ function demarrerSuivi(cle) {
     let file = Promise.resolve();
     function recevoir(payload) {
         file = file.then(async () => {
-            const r = await lireMessagePartage(payload, { sessionId, cle, dernierTs });
+            const r = await lireMessagePartage(payload, { sessionId, cle, chiffre, dernierTs });
             if (!r.ok) {
                 refusTant++;
                 console.warn('[suivi] message refusé :', r.motif);

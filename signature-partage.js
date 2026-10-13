@@ -19,16 +19,37 @@ function decoderB64Url(txt) {
     return octets;
 }
 
-/* Identifiant `s` et clé publique `k` du lien. Le FRAGMENT d'abord (`#s=…&k=…`, émis
-   depuis le 02/10/2026), la requête ensuite (`?s=…`, APK antérieurs) : un lien déjà
-   envoyé sur WhatsApp doit continuer de marcher après la mise à jour de cette page.
-   `s` et `k` se lisent au MÊME endroit — jamais l'identifiant d'un côté et la clé de
-   l'autre. */
+/* Identifiant `s`, clé publique `k` et clé de chiffrement `c` du lien. Le FRAGMENT
+   d'abord (`#s=…&k=…&c=…`), la requête ensuite (`?s=…`, APK d'avant le 02/10/2026 —
+   lu pour pouvoir dire au suiveur que son lien est trop ancien, plus pour l'afficher).
+   `s`, `k` et `c` se lisent au MÊME endroit — jamais l'identifiant d'un côté et une
+   clé de l'autre. */
 function lireLienSuivi(hash, search) {
     const h = new URLSearchParams(String(hash || '').replace(/^#/, ''));
     const q = new URLSearchParams(String(search || '').replace(/^\?/, ''));
     const src = h.get('s') ? h : q;
-    return { s: src.get('s') || null, k: src.get('k') || null };
+    return { s: src.get('s') || null, k: src.get('k') || null, c: src.get('c') || null };
+}
+
+/* Clé de chiffrement du lien → CryptoKey AES-GCM de déchiffrement, ou `null` si elle
+   est illisible (13/10/2026). Même règle que la clé publique : `null` n'ouvre AUCUN
+   repli, l'appelant affiche « lien abîmé ». */
+async function importerCleChiffre(c) {
+    const octets = decoderB64Url(c);
+    if (!octets || octets.length !== 32) return null;   // AES-256
+    try {
+        return await crypto.subtle.importKey('raw', octets, { name: 'AES-GCM' }, false, ['decrypt']);
+    } catch (e) { return null; }
+}
+
+/* Vérifie la signature `sig` de la chaîne `texte`. */
+async function signatureValide(cle, sigB64, texte) {
+    const sig = decoderB64Url(sigB64);
+    if (!sig || sig.length !== 64) return null;   // illisible
+    try {
+        return await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, cle, sig,
+                                          new TextEncoder().encode(texte));
+    } catch (e) { return false; }
 }
 
 /* Clé publique du lien → CryptoKey de vérification, ou `null` si elle est illisible.
@@ -45,9 +66,21 @@ async function importerClePartage(k) {
     } catch (e) { return null; }
 }
 
-/* Lit un message reçu sur le canal. `ctx` : `{ sessionId, cle, dernierTs }` — `cle`
-   à `null` pour un lien SANS clé (APK antérieur), où l'on accepte le message en clair
-   comme avant. Rend `{ ok: true, donnees }` ou `{ ok: false, motif }`.
+/* Lit un message reçu sur le canal. `ctx` : `{ sessionId, cle, chiffre, dernierTs }`.
+   Rend `{ ok: true, donnees }` ou `{ ok: false, motif }`.
+
+   ⚠⚠ PLUS DE MODE EN CLAIR (13/10/2026) : `cle` à `null` refuse TOUT. Le repli
+   « lien sans clé » était la seule porte non signée de la page ; l'app ne partage
+   plus sans WebCrypto, il n'a donc plus d'émetteur légitime.
+   ⚠⚠ CHIFFRÉ (`chiffre` présent, lien `&c=`) : `{ v: 2, iv, c, sig }`, où `c` est la
+   chaîne signée chiffrée en AES-GCM et `sig` signe `iv + '.' + c` — on vérifie
+   l'auteur AVANT de déchiffrer, et un message en clair (v1) y est refusé : un lien
+   chiffré n'accepte que du chiffré. Sans `chiffre` (lien `#s=…&k=…` émis du 02 au
+   13/10/2026), le format signé en clair `{ v: 1, d, sig }` reste lu.
+   ⚠ La clé de chiffrement est DANS le lien : elle protège la position de qui ne
+   connaît que l'identifiant du canal (Supabase, ses journaux, un abonné au nom
+   deviné ou capté), pas de qui détient le lien entier. Elle ne dit RIEN de l'auteur —
+   qui a le lien peut chiffrer ; c'est la signature qui le dit.
 
    ⚠ `dernierTs` REFUSE LE REJEU : un message authentique capté sur le canal reste
    authentique pour toujours. Le renvoyer plus tard ramènerait le point en arrière, et
@@ -58,20 +91,31 @@ async function importerClePartage(k) {
 async function lireMessagePartage(payload, ctx) {
     const refus = (motif) => ({ ok: false, motif });
     if (!payload || typeof payload !== 'object') return refus('illisible');
-    if (!ctx.cle) return { ok: true, donnees: payload };
+    if (!ctx.cle) return refus('sans-cle');
 
-    if (typeof payload.d !== 'string' || typeof payload.sig !== 'string') return refus('non-signe');
-    const sig = decoderB64Url(payload.sig);
-    if (!sig || sig.length !== 64) return refus('signature-illisible');
-    let valide = false;
-    try {
-        valide = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, ctx.cle, sig,
-                                            new TextEncoder().encode(payload.d));
-    } catch (e) { valide = false; }
-    if (!valide) return refus('signature-fausse');
+    let texte;
+    if (ctx.chiffre) {
+        if (payload.v !== 2 || typeof payload.iv !== 'string' || typeof payload.c !== 'string'
+            || typeof payload.sig !== 'string') return refus('non-chiffre');
+        const valide = await signatureValide(ctx.cle, payload.sig, payload.iv + '.' + payload.c);
+        if (valide === null) return refus('signature-illisible');
+        if (!valide) return refus('signature-fausse');
+        const iv = decoderB64Url(payload.iv), ct = decoderB64Url(payload.c);
+        if (!iv || iv.length !== 12 || !ct) return refus('illisible');
+        try {
+            texte = new TextDecoder().decode(
+                await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, ctx.chiffre, ct));
+        } catch (e) { return refus('dechiffrement'); }
+    } else {
+        if (typeof payload.d !== 'string' || typeof payload.sig !== 'string') return refus('non-signe');
+        const valide = await signatureValide(ctx.cle, payload.sig, payload.d);
+        if (valide === null) return refus('signature-illisible');
+        if (!valide) return refus('signature-fausse');
+        texte = payload.d;
+    }
 
     let d;
-    try { d = JSON.parse(payload.d); } catch (e) { return refus('illisible'); }
+    try { d = JSON.parse(texte); } catch (e) { return refus('illisible'); }
     if (!d || typeof d !== 'object') return refus('illisible');
     if (d.s !== ctx.sessionId) return refus('autre-session');
     if (typeof d.ts !== 'number' || !isFinite(d.ts)) return refus('sans-date');
